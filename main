@@ -1,0 +1,808 @@
+import os
+import asyncio
+import json
+import logging
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
+
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.base import JobLookupError
+
+import aiosqlite
+
+# ---------- ГЛОБАЛЬНЫЕ API (Telegram X) ----------
+API_ID = 21724
+API_HASH = "3e0cb5efcd52300aec5994fdfc5bdc16"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан")
+
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+logging.basicConfig(level=logging.INFO)
+
+# ---------- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ----------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                interval_seconds INTEGER DEFAULT 3600
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                phone TEXT,
+                username TEXT,
+                session_string TEXT,
+                is_active INTEGER DEFAULT 1,
+                sent_count INTEGER DEFAULT 0,
+                chats TEXT DEFAULT '[]',   -- JSON: [{"id": 123, "title": "Название"}, ...]
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                text TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS scheduler_jobs (
+                user_id INTEGER PRIMARY KEY,
+                job_id TEXT
+            )
+        ''')
+        await db.commit()
+
+# ---------- РАБОТА С БАЗОЙ ----------
+async def get_user_settings(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT interval_seconds FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row:
+            return {"interval_seconds": row[0]}
+        else:
+            await db.execute("INSERT INTO users (user_id, interval_seconds) VALUES (?, ?)", (user_id, 3600))
+            await db.commit()
+            return {"interval_seconds": 3600}
+
+async def update_user_settings(user_id: int, interval_seconds=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if interval_seconds is not None:
+            await db.execute("UPDATE users SET interval_seconds = ? WHERE user_id = ?", (interval_seconds, user_id))
+            await db.commit()
+
+async def get_accounts(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, phone, username, session_string, is_active, sent_count, chats FROM accounts WHERE user_id = ?",
+            (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return [{"id": r[0], "phone": r[1], "username": r[2], "session_string": r[3],
+                 "is_active": bool(r[4]), "sent_count": r[5], "chats": json.loads(r[6])} for r in rows]
+
+async def get_account_by_id(account_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, phone, username, session_string, is_active, sent_count, chats FROM accounts WHERE id = ? AND user_id = ?",
+            (account_id, user_id)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return {"id": row[0], "phone": row[1], "username": row[2], "session_string": row[3],
+                    "is_active": bool(row[4]), "sent_count": row[5], "chats": json.loads(row[6])}
+        return None
+
+async def add_account(user_id: int, phone: str, username: str, session_string: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO accounts (user_id, phone, username, session_string, chats) VALUES (?, ?, ?, ?, ?)",
+            (user_id, phone, username, session_string, json.dumps([]))
+        )
+        await db.commit()
+
+async def toggle_account_active(account_id: int, user_id: int, active: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE accounts SET is_active = ? WHERE id = ? AND user_id = ?",
+            (1 if active else 0, account_id, user_id)
+        )
+        await db.commit()
+
+async def increment_sent_count(account_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE accounts SET sent_count = sent_count + 1 WHERE id = ? AND user_id = ?",
+            (account_id, user_id)
+        )
+        await db.commit()
+
+async def update_account_chats(account_id: int, user_id: int, chats: list):
+    # chats: список словарей [{"id": int, "title": str}, ...]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE accounts SET chats = ? WHERE id = ? AND user_id = ?",
+            (json.dumps(chats), account_id, user_id)
+        )
+        await db.commit()
+
+async def get_messages(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, text FROM messages WHERE user_id = ?", (user_id,))
+        rows = await cursor.fetchall()
+        return [{"id": r[0], "text": r[1]} for r in rows]
+
+async def add_message(user_id: int, text: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO messages (user_id, text) VALUES (?, ?)", (user_id, text))
+        await db.commit()
+
+async def delete_message(msg_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM messages WHERE id = ? AND user_id = ?", (msg_id, user_id))
+        await db.commit()
+
+async def save_job_id(user_id: int, job_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO scheduler_jobs (user_id, job_id) VALUES (?, ?)", (user_id, job_id))
+        await db.commit()
+
+async def get_job_id(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT job_id FROM scheduler_jobs WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+async def delete_job_id(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM scheduler_jobs WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+# ---------- КЛАВИАТУРЫ ----------
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Аккаунты")],
+            [KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="▶️ Запустить рассылку")]
+        ],
+        resize_keyboard=True
+    )
+
+def accounts_keyboard(accounts):
+    kb = []
+    for acc in accounts:
+        status = "✅" if acc['is_active'] else "❌"
+        username = acc['username'] if acc['username'] else "без ника"
+        display = f"{status} @{username} • {acc['phone']} • {acc['sent_count']}"
+        kb.append([KeyboardButton(text=display)])
+    kb.append([KeyboardButton(text="➕ Добавить аккаунт")])
+    kb.append([KeyboardButton(text="🔙 Назад")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def account_detail_keyboard(account_id: int, is_active: bool):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔄 Переключить активность",
+            callback_data=f"acc_toggle_{account_id}"
+        )],
+        [InlineKeyboardButton(text="📋 Чаты", callback_data=f"acc_chats_{account_id}")],
+        [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="back_to_accounts")]
+    ])
+
+def chats_inline_keyboard(account_id: int, chats: list):
+    # chats: [{"id": 123, "title": "Название"}, ...]
+    kb = []
+    for i, chat in enumerate(chats):
+        title = chat.get('title', str(chat['id']))
+        kb.append([InlineKeyboardButton(text=f"❌ {title}", callback_data=f"acc_del_chat_{account_id}_{i}")])
+    kb.append([InlineKeyboardButton(text="➕ Добавить чат", callback_data=f"acc_add_chat_{account_id}")])
+    kb.append([InlineKeyboardButton(text="📩 Последние 3", callback_data=f"acc_show_msgs_{account_id}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{account_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def settings_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Тексты", callback_data="settings_messages")],
+        [InlineKeyboardButton(text="⏱ Интервал", callback_data="settings_interval")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_back")]
+    ])
+
+def messages_inline_keyboard(messages):
+    kb = []
+    for msg in messages:
+        kb.append([InlineKeyboardButton(text=f"❌ {msg['text'][:30]}...", callback_data=f"del_msg_{msg['id']}")])
+    kb.append([InlineKeyboardButton(text="➕ Добавить текст", callback_data="add_msg")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="settings_back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def interval_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 мин", callback_data="set_int_60"),
+         InlineKeyboardButton(text="5 мин", callback_data="set_int_300"),
+         InlineKeyboardButton(text="10 мин", callback_data="set_int_600")],
+        [InlineKeyboardButton(text="30 мин", callback_data="set_int_1800"),
+         InlineKeyboardButton(text="1 час", callback_data="set_int_3600"),
+         InlineKeyboardButton(text="3 часа", callback_data="set_int_10800")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_back")]
+    ])
+
+# ---------- FSM ----------
+class AddAccountStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
+
+class EditMessagesStates(StatesGroup):
+    waiting_new_message = State()
+
+class AddChatStates(StatesGroup):
+    waiting_chat_input = State()
+
+# ---------- ФУНКЦИЯ ОТПРАВКИ (по chat_id) ----------
+async def send_messages_for_user(user_id: int):
+    try:
+        accounts = await get_accounts(user_id)
+        if not accounts:
+            return
+        messages = await get_messages(user_id)
+        if not messages:
+            return
+
+        for acc in accounts:
+            if not acc['is_active']:
+                continue
+            if not acc['chats']:
+                continue
+            client = TelegramClient(acc['session_string'], API_ID, API_HASH)
+            try:
+                await client.start()
+                for chat in acc['chats']:
+                    chat_id = chat['id']
+                    for msg in messages:
+                        try:
+                            await client.send_message(chat_id, msg['text'])
+                            await increment_sent_count(acc['id'], user_id)
+                            await asyncio.sleep(1)
+                        except FloodWaitError as e:
+                            logging.warning(f"FloodWait: ждём {e.seconds} сек")
+                            await asyncio.sleep(e.seconds)
+                        except Exception as e:
+                            logging.error(f"Ошибка отправки в чат {chat_id}: {e}")
+            except Exception as e:
+                logging.error(f"Ошибка клиента для {acc['phone']}: {e}")
+            finally:
+                await client.disconnect()
+    except Exception as e:
+        logging.error(f"Ошибка в задаче для {user_id}: {e}")
+
+# ---------- ПЛАНИРОВЩИК ----------
+scheduler = AsyncIOScheduler()
+
+async def start_scheduler_for_user(user_id: int):
+    job_id = await get_job_id(user_id)
+    if job_id:
+        try:
+            scheduler.get_job(job_id)
+            return
+        except JobLookupError:
+            await delete_job_id(user_id)
+
+    settings = await get_user_settings(user_id)
+    interval = settings['interval_seconds']
+    job = scheduler.add_job(
+        send_messages_for_user,
+        'interval',
+        seconds=interval,
+        args=[user_id],
+        id=f"mailing_{user_id}",
+        replace_existing=True
+    )
+    await save_job_id(user_id, job.id)
+
+async def stop_scheduler_for_user(user_id: int):
+    job_id = await get_job_id(user_id)
+    if job_id:
+        try:
+            scheduler.remove_job(job_id)
+        except JobLookupError:
+            pass
+        await delete_job_id(user_id)
+
+async def restore_schedulers_on_startup():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM scheduler_jobs")
+        rows = await cursor.fetchall()
+    for row in rows:
+        user_id = row[0]
+        await start_scheduler_for_user(user_id)
+
+# ---------- ОБРАБОТЧИКИ ----------
+dp = Dispatcher(storage=MemoryStorage())
+
+@dp.message(F.text == "/start")
+async def cmd_start(message: types.Message):
+    await message.answer("Привет! Бот для рассылки.", reply_markup=main_keyboard())
+
+# ---------- АККАУНТЫ ----------
+@dp.message(F.text == "📋 Аккаунты")
+async def show_accounts(message: types.Message):
+    accounts = await get_accounts(message.from_user.id)
+    if not accounts:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="➕ Добавить аккаунт")],
+                      [KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
+        await message.answer("Нет аккаунтов.", reply_markup=kb)
+    else:
+        await message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+
+@dp.message(F.text == "➕ Добавить аккаунт")
+async def add_account_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите номер телефона в формате +79123456789:")
+    await state.set_state(AddAccountStates.waiting_phone)
+
+@dp.message(AddAccountStates.waiting_phone)
+async def add_account_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    if not phone.startswith('+'):
+        await message.answer("Номер должен начинаться с +.")
+        return
+    await state.update_data(phone=phone)
+    client = TelegramClient(None, API_ID, API_HASH)
+    await state.update_data(client=client)
+    try:
+        await client.connect()
+        await client.send_code_request(phone)
+        await message.answer("Код отправлен. Введите его:")
+        await state.set_state(AddAccountStates.waiting_code)
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+        await state.clear()
+        await client.disconnect()
+
+@dp.message(AddAccountStates.waiting_code)
+async def add_account_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    data = await state.get_data()
+    client = data.get('client')
+    phone = data.get('phone')
+    if not client:
+        await message.answer("Сессия потеряна.")
+        await state.clear()
+        return
+    try:
+        await client.sign_in(phone, code)
+        session_string = client.session.save()
+        me = await client.get_me()
+        username = me.username if me.username else None
+        await add_account(message.from_user.id, phone, username, session_string)
+        await message.answer("Аккаунт добавлен!")
+        accounts = await get_accounts(message.from_user.id)
+        await message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+    except SessionPasswordNeededError:
+        await message.answer("Введите пароль двухфакторной аутентификации:")
+        await state.set_state(AddAccountStates.waiting_password)
+        return
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    await client.disconnect()
+    await state.clear()
+
+@dp.message(AddAccountStates.waiting_password)
+async def add_account_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    client = data.get('client')
+    phone = data.get('phone')
+    if not client:
+        await message.answer("Сессия потеряна.")
+        await state.clear()
+        return
+    try:
+        await client.sign_in(password=password)
+        session_string = client.session.save()
+        me = await client.get_me()
+        username = me.username if me.username else None
+        await add_account(message.from_user.id, phone, username, session_string)
+        await message.answer("Аккаунт добавлен!")
+        accounts = await get_accounts(message.from_user.id)
+        await message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    await client.disconnect()
+    await state.clear()
+
+# ---------- ОТКРЫТИЕ ДЕТАЛЕЙ АККАУНТА ----------
+@dp.message(F.text.startswith("✅") or F.text.startswith("❌"))
+async def account_detail(message: types.Message):
+    parts = message.text.split(" • ")
+    if len(parts) < 3:
+        await message.answer("Не удалось распознать аккаунт.")
+        return
+    phone = parts[1].strip()
+    accounts = await get_accounts(message.from_user.id)
+    acc = next((a for a in accounts if a['phone'] == phone), None)
+    if not acc:
+        await message.answer("Аккаунт не найден.")
+        return
+    text = (f"📱 Аккаунт: @{acc['username'] if acc['username'] else 'без ника'}\n"
+            f"📞 Номер: {acc['phone']}\n"
+            f"📊 Отправлено: {acc['sent_count']}\n"
+            f"Статус: {'✅ Включён' if acc['is_active'] else '❌ Выключен'}\n"
+            f"Чаты: {len(acc['chats'])}")
+    await message.answer(text, reply_markup=account_detail_keyboard(acc['id'], acc['is_active']))
+
+# ---------- ИНЛАЙН-КНОПКИ ДЕТАЛЕЙ АККАУНТА ----------
+@dp.callback_query(F.data.startswith("acc_toggle_"))
+async def toggle_account_callback(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    acc = await get_account_by_id(account_id, user_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    new_active = not acc['is_active']
+    await toggle_account_active(account_id, user_id, new_active)
+    await callback.answer(f"Аккаунт {'включён' if new_active else 'выключен'}")
+    acc = await get_account_by_id(account_id, user_id)
+    text = (f"📱 Аккаунт: @{acc['username'] if acc['username'] else 'без ника'}\n"
+            f"📞 Номер: {acc['phone']}\n"
+            f"📊 Отправлено: {acc['sent_count']}\n"
+            f"Статус: {'✅ Включён' if acc['is_active'] else '❌ Выключен'}\n"
+            f"Чаты: {len(acc['chats'])}")
+    await callback.message.edit_text(text, reply_markup=account_detail_keyboard(acc['id'], acc['is_active']))
+
+@dp.callback_query(F.data.startswith("acc_chats_"))
+async def account_chats(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    acc = await get_account_by_id(account_id, user_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    chats = acc['chats']
+    if not chats:
+        text = "У этого аккаунта нет чатов."
+    else:
+        text = "Чаты:\n" + "\n".join([f"{i+1}. {chat.get('title', chat['id'])}" for i, chat in enumerate(chats)])
+    await callback.message.edit_text(text, reply_markup=chats_inline_keyboard(account_id, chats))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("acc_back_"))
+async def back_to_account_detail(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    acc = await get_account_by_id(account_id, user_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    text = (f"📱 Аккаунт: @{acc['username'] if acc['username'] else 'без ника'}\n"
+            f"📞 Номер: {acc['phone']}\n"
+            f"📊 Отправлено: {acc['sent_count']}\n"
+            f"Статус: {'✅ Включён' if acc['is_active'] else '❌ Выключен'}\n"
+            f"Чаты: {len(acc['chats'])}")
+    try:
+        await callback.message.edit_text(text, reply_markup=account_detail_keyboard(acc['id'], acc['is_active']))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_accounts")
+async def back_to_accounts_list(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    accounts = await get_accounts(user_id)
+    if not accounts:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="➕ Добавить аккаунт")],
+                      [KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
+        await callback.message.delete()
+        await callback.message.answer("Нет аккаунтов.", reply_markup=kb)
+    else:
+        await callback.message.delete()
+        await callback.message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+    await callback.answer()
+
+# ---------- УПРАВЛЕНИЕ ЧАТАМИ (вступление + сохранение названия) ----------
+@dp.callback_query(F.data.startswith("acc_add_chat_"))
+async def add_chat_start(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[3])
+    await state.update_data(account_id=account_id)
+    await callback.message.answer("Введите ссылку (t.me/...) или юзернейм (@chat):")
+    await state.set_state(AddChatStates.waiting_chat_input)
+    await callback.answer()
+
+@dp.message(AddChatStates.waiting_chat_input)
+async def add_chat_save(message: types.Message, state: FSMContext):
+    chat_input = message.text.strip()
+    data = await state.get_data()
+    account_id = data.get('account_id')
+    user_id = message.from_user.id
+    acc = await get_account_by_id(account_id, user_id)
+    if not acc:
+        await message.answer("Аккаунт не найден.")
+        await state.clear()
+        return
+
+    client = TelegramClient(acc['session_string'], API_ID, API_HASH)
+    try:
+        await client.start()
+        # Получаем entity
+        try:
+            entity = await client.get_entity(chat_input)
+        except Exception:
+            # Если не получилось – возможно, инвайт-ссылка
+            if 'joinchat' in chat_input or 't.me/joinchat' in chat_input or 't.me/+' in chat_input:
+                try:
+                    entity = await client.join_chat(chat_input)
+                except Exception as e2:
+                    await message.answer(f"Не удалось вступить по ссылке: {e2}")
+                    await client.disconnect()
+                    await state.clear()
+                    return
+            else:
+                await message.answer(f"Чат не найден. Попробуйте ID или ссылку.")
+                await client.disconnect()
+                await state.clear()
+                return
+
+        # Вступаем (если ещё не участник)
+        try:
+            await client.join_channel(entity)
+        except Exception:
+            pass  # уже участник
+
+        chat_id = entity.id
+        title = getattr(entity, 'title', None) or str(chat_id)
+        chats = acc['chats']
+        # Проверяем, нет ли уже такого ID
+        if not any(c['id'] == chat_id for c in chats):
+            chats.append({"id": chat_id, "title": title})
+            await update_account_chats(account_id, user_id, chats)
+            await message.answer(f"✅ Вступление выполнено. Чат '{title}' добавлен (ID: {chat_id}).")
+        else:
+            await message.answer("Этот чат уже есть в списке.")
+
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    finally:
+        await client.disconnect()
+        await state.clear()
+
+    # Обновляем отображение
+    acc = await get_account_by_id(account_id, user_id)
+    chats = acc['chats']
+    if not chats:
+        text = "У этого аккаунта нет чатов."
+    else:
+        text = "Чаты:\n" + "\n".join([f"{i+1}. {chat.get('title', chat['id'])}" for i, chat in enumerate(chats)])
+    await message.answer(text, reply_markup=chats_inline_keyboard(account_id, chats))
+
+@dp.callback_query(F.data.startswith("acc_del_chat_"))
+async def delete_chat_from_account(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    account_id = int(parts[3])
+    index = int(parts[4])
+    user_id = callback.from_user.id
+    acc = await get_account_by_id(account_id, user_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    chats = acc['chats']
+    if 0 <= index < len(chats):
+        deleted = chats.pop(index)
+        await update_account_chats(account_id, user_id, chats)
+        await callback.answer(f"Чат '{deleted.get('title', deleted['id'])}' удалён.")
+        if not chats:
+            text = "У этого аккаунта нет чатов."
+        else:
+            text = "Чаты:\n" + "\n".join([f"{i+1}. {chat.get('title', chat['id'])}" for i, chat in enumerate(chats)])
+        await callback.message.edit_text(text, reply_markup=chats_inline_keyboard(account_id, chats))
+    else:
+        await callback.answer("Чат не найден.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("acc_show_msgs_"))
+async def show_last_messages(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[3])
+    user_id = callback.from_user.id
+    acc = await get_account_by_id(account_id, user_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    if not acc['chats']:
+        await callback.answer("Нет чатов.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for i, chat in enumerate(acc['chats']):
+        title = chat.get('title', str(chat['id']))
+        kb.inline_keyboard.append([InlineKeyboardButton(text=title, callback_data=f"acc_show_chat_{account_id}_{i}")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_chats_{account_id}")])
+    await callback.message.edit_text("Выберите чат для просмотра последних 3 сообщений:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("acc_show_chat_"))
+async def show_chat_messages(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    account_id = int(parts[3])
+    index = int(parts[4])
+    user_id = callback.from_user.id
+    acc = await get_account_by_id(account_id, user_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    chats = acc['chats']
+    if not (0 <= index < len(chats)):
+        await callback.answer("Чат не найден.", show_alert=True)
+        return
+    chat = chats[index]
+    chat_id = chat['id']
+    title = chat.get('title', str(chat_id))
+    client = TelegramClient(acc['session_string'], API_ID, API_HASH)
+    try:
+        await client.start()
+        messages = await client.get_messages(chat_id, limit=3)
+        if not messages:
+            text = f"В чате '{title}' нет сообщений."
+        else:
+            text = f"Последние 3 сообщения в чате '{title}':\n\n"
+            for msg in messages:
+                sender = msg.sender_id if msg.sender_id else "Unknown"
+                text += f"👤 {sender}: {msg.text or '[медиа]'}\n"
+        await callback.message.edit_text(text, reply_markup=chats_inline_keyboard(account_id, chats))
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка: {e}", reply_markup=chats_inline_keyboard(account_id, chats))
+    finally:
+        await client.disconnect()
+    await callback.answer()
+
+# ---------- НАСТРОЙКИ ----------
+@dp.message(F.text == "⚙️ Настройки")
+async def settings_menu(message: types.Message):
+    await message.answer("Выберите раздел:", reply_markup=settings_keyboard())
+
+@dp.callback_query(F.data == "settings_messages")
+async def settings_messages(callback: types.CallbackQuery):
+    messages = await get_messages(callback.from_user.id)
+    text = "Ваши сообщения:\n" + "\n".join([f"{i+1}. {m['text'][:50]}..." for i, m in enumerate(messages)]) if messages else "Нет сообщений."
+    await callback.message.edit_text(text, reply_markup=messages_inline_keyboard(messages))
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_msg")
+async def add_msg_prompt(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите текст:")
+    await state.set_state(EditMessagesStates.waiting_new_message)
+    await callback.answer()
+
+@dp.message(EditMessagesStates.waiting_new_message)
+async def add_msg_save(message: types.Message, state: FSMContext):
+    await add_message(message.from_user.id, message.text)
+    await message.answer("Добавлено!")
+    await state.clear()
+    messages = await get_messages(message.from_user.id)
+    await message.answer("Ваши сообщения:", reply_markup=messages_inline_keyboard(messages))
+
+@dp.callback_query(F.data.startswith("del_msg_"))
+async def delete_msg(callback: types.CallbackQuery):
+    msg_id = int(callback.data.split("_")[2])
+    await delete_message(msg_id, callback.from_user.id)
+    await callback.answer("Удалено")
+    messages = await get_messages(callback.from_user.id)
+    await callback.message.edit_text("Ваши сообщения:", reply_markup=messages_inline_keyboard(messages))
+
+@dp.callback_query(F.data == "settings_interval")
+async def settings_interval(callback: types.CallbackQuery):
+    settings = await get_user_settings(callback.from_user.id)
+    current = settings['interval_seconds']
+    desc = f"{current//3600} ч {current%3600//60} мин" if current >= 3600 else f"{current//60} мин"
+    await callback.message.edit_text(
+        f"Текущий интервал: {desc}\nВыберите новый:",
+        reply_markup=interval_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_int_"))
+async def set_interval(callback: types.CallbackQuery):
+    seconds = int(callback.data.split("_")[2])
+    await update_user_settings(callback.from_user.id, interval_seconds=seconds)
+    job_id = await get_job_id(callback.from_user.id)
+    if job_id:
+        await stop_scheduler_for_user(callback.from_user.id)
+        await start_scheduler_for_user(callback.from_user.id)
+    await callback.answer(f"Интервал {seconds} сек")
+    await callback.message.edit_text(f"Установлено {seconds} сек.", reply_markup=settings_keyboard())
+
+@dp.callback_query(F.data == "settings_back")
+async def settings_back(callback: types.CallbackQuery):
+    try:
+        await callback.message.edit_text("Выберите раздел:", reply_markup=settings_keyboard())
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+# ---------- ЗАПУСК / ОСТАНОВКА РАССЫЛКИ ----------
+@dp.message(F.text == "▶️ Запустить рассылку")
+async def start_mailing(message: types.Message):
+    user_id = message.from_user.id
+    job_id = await get_job_id(user_id)
+    if job_id:
+        try:
+            scheduler.get_job(job_id)
+            await message.answer("Рассылка уже запущена.")
+            return
+        except JobLookupError:
+            await delete_job_id(user_id)
+
+    accounts = await get_accounts(user_id)
+    active_accounts = [a for a in accounts if a['is_active']]
+    if not active_accounts:
+        await message.answer("Нет активных аккаунтов.")
+        return
+    for acc in active_accounts:
+        if not acc['chats']:
+            await message.answer(f"У аккаунта @{acc['username'] if acc['username'] else 'без ника'} нет чатов.")
+            return
+    messages = await get_messages(user_id)
+    if not messages:
+        await message.answer("Нет сообщений для рассылки.")
+        return
+
+    await start_scheduler_for_user(user_id)
+    asyncio.create_task(send_messages_for_user(user_id))
+
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Аккаунты")],
+            [KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="⏹ Остановить рассылку")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Рассылка запущена! Первая отправка выполнена.", reply_markup=kb)
+
+@dp.message(F.text == "⏹ Остановить рассылку")
+async def stop_mailing(message: types.Message):
+    user_id = message.from_user.id
+    await stop_scheduler_for_user(user_id)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Аккаунты")],
+            [KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="▶️ Запустить рассылку")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Рассылка остановлена.", reply_markup=kb)
+
+# ---------- ВОЗВРАТ В ГЛАВНОЕ МЕНЮ ----------
+@dp.message(F.text == "🔙 Назад")
+async def back_to_main(message: types.Message):
+    await message.answer("Главное меню:", reply_markup=main_keyboard())
+
+# ---------- ЗАПУСК ----------
+async def main():
+    await init_db()
+    bot = Bot(token=BOT_TOKEN)
+    await restore_schedulers_on_startup()
+    if not scheduler.running:
+        scheduler.start()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
