@@ -1,0 +1,1777 @@
+import os
+import asyncio
+import json
+import logging
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
+
+from telethon import TelegramClient, functions, types as tl_types, utils
+from telethon.sessions import StringSession
+from telethon.errors import (
+    SessionPasswordNeededError, FloodWaitError,
+    UserAlreadyParticipantError, UsernameOccupiedError,
+    UsernameInvalidError, UserPrivacyRestrictedError,
+    UserNotMutualContactError, UserChannelsTooMuchError,
+    ChatAdminRequiredError, PeerFloodError,
+)
+from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.tl.functions.messages import AddChatUserRequest
+from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
+from telethon.tl.functions.photos import (
+    UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest
+)
+from telethon.tl.functions.contacts import AddContactRequest
+from telethon.tl.types import ChannelParticipantsSearch, InputPeerChannel, InputPeerUser
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.base import JobLookupError
+
+import aiosqlite
+
+API_ID = 2040
+API_HASH = "b18441a1ff607e10a989891a5462e627"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан")
+
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+DEFAULT_INVITE_LIMIT = 100000
+DEFAULT_PARSE_LIMIT = 100000
+DEFAULT_DELAY = 0.0
+DEFAULT_INTERVAL = 3600
+PROCESS_INTERVAL = 3600
+MAX_MESSAGES_SCAN = 100000
+
+scheduler = AsyncIOScheduler()
+dp = Dispatcher(storage=MemoryStorage())
+RUNNING = set()
+
+
+def make_client(session_string):
+    return TelegramClient(
+        StringSession(session_string) if session_string else StringSession(),
+        API_ID, API_HASH,
+        device_model="PC 64bit",
+        system_version="Windows 10",
+        app_version="4.16.8",
+        lang_code="ru",
+        system_lang_code="ru",
+    )
+
+
+async def init_db():
+    logging.info("init_db start")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT,
+            invite_limit INTEGER DEFAULT 100000, parse_limit INTEGER DEFAULT 100000,
+            delay REAL DEFAULT 0.0, interval INTEGER DEFAULT 3600)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, username TEXT,
+            session_string TEXT, is_active INTEGER DEFAULT 1,
+            invited_count INTEGER DEFAULT 0, parsed_count INTEGER DEFAULT 0, sent_count INTEGER DEFAULT 0,
+            sources TEXT DEFAULT '[]', target TEXT DEFAULT 'null',
+            chats TEXT DEFAULT '[]')''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, account_id INTEGER,
+            target_id INTEGER, target_type TEXT, target_access_hash INTEGER, uid INTEGER,
+            user_username TEXT, first_name TEXT, last_name TEXT, access_hash INTEGER,
+            status TEXT DEFAULT 'pending', error TEXT)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS invited (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, target_id INTEGER, uid INTEGER,
+            UNIQUE(user_id, target_id, uid))''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS jobs (
+            user_id INTEGER PRIMARY KEY, mailing_id TEXT, parsing_id TEXT)''')
+        await db.commit()
+    logging.info("init_db done")
+
+
+async def ensure_user(uid, uname=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (uid,))
+        r = await cur.fetchone()
+        if not r:
+            await db.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (uid, uname))
+        elif uname:
+            await db.execute("UPDATE users SET username = ? WHERE user_id = ?", (uname, uid))
+        await db.commit()
+
+
+async def get_settings(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT invite_limit, parse_limit, delay, interval FROM users WHERE user_id = ?", (uid,))
+        r = await cur.fetchone()
+        if r:
+            return {"invite_limit": r[0], "parse_limit": r[1], "delay": r[2], "interval": r[3]}
+        return {"invite_limit": DEFAULT_INVITE_LIMIT, "parse_limit": DEFAULT_PARSE_LIMIT,
+                "delay": DEFAULT_DELAY, "interval": DEFAULT_INTERVAL}
+
+
+async def set_setting(uid, key, val):
+    if key not in {"invite_limit", "parse_limit", "delay", "interval"}:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE users SET {key} = ? WHERE user_id = ?", (val, uid))
+        await db.commit()
+
+
+async def get_accounts(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, phone, username, session_string, is_active, invited_count, parsed_count, sent_count, sources, target, chats FROM accounts WHERE user_id = ?",
+            (uid,))
+        rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            def jload(v, d):
+                if not v or v == "null":
+                    return d
+                try:
+                    return json.loads(v)
+                except Exception:
+                    return d
+            out.append({"id": r[0], "phone": r[1], "username": r[2], "session_string": r[3],
+                        "is_active": bool(r[4]), "invited_count": r[5], "parsed_count": r[6],
+                        "sent_count": r[7],
+                        "sources": jload(r[8], []),
+                        "target": jload(r[9], None),
+                        "chats": jload(r[10], [])})
+        return out
+
+
+async def get_account(acc_id, uid):
+    for a in await get_accounts(uid):
+        if a["id"] == acc_id:
+            return a
+    return None
+
+
+async def add_account(uid, phone, uname, sess):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO accounts (user_id, phone, username, session_string) VALUES (?, ?, ?, ?)",
+                         (uid, phone, uname, sess))
+        await db.commit()
+
+
+async def toggle_acc(acc_id, uid, active):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET is_active = ? WHERE id = ? AND user_id = ?",
+                         (1 if active else 0, acc_id, uid))
+        await db.commit()
+
+
+async def save_sources(acc_id, uid, sources):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET sources = ? WHERE id = ? AND user_id = ?",
+                         (json.dumps(sources), acc_id, uid))
+        await db.commit()
+
+
+async def save_target(acc_id, uid, target):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET target = ? WHERE id = ? AND user_id = ?",
+                         (json.dumps(target) if target is not None else "null", acc_id, uid))
+        await db.commit()
+
+
+async def save_chats(acc_id, uid, chats):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET chats = ? WHERE id = ? AND user_id = ?",
+                         (json.dumps(chats), acc_id, uid))
+        await db.commit()
+
+
+async def save_username(acc_id, uid, uname):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET username = ? WHERE id = ? AND user_id = ?", (uname, acc_id, uid))
+        await db.commit()
+
+
+async def inc_parsed(acc_id, uid, d):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET parsed_count = parsed_count + ? WHERE id = ? AND user_id = ?",
+                         (d, acc_id, uid))
+        await db.commit()
+
+
+async def inc_invited(acc_id, uid, d=1):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET invited_count = invited_count + ? WHERE id = ? AND user_id = ?",
+                         (d, acc_id, uid))
+        await db.commit()
+
+
+async def inc_sent(acc_id, uid, d=1):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET sent_count = sent_count + ? WHERE id = ? AND user_id = ?",
+                         (d, acc_id, uid))
+        await db.commit()
+
+
+async def del_account(acc_id, uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM accounts WHERE id = ? AND user_id = ?", (acc_id, uid))
+        await db.commit()
+
+
+async def get_messages(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, text FROM messages WHERE user_id = ?", (uid,))
+        return [{"id": r[0], "text": r[1]} for r in await cur.fetchall()]
+
+
+async def add_message(uid, text):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO messages (user_id, text) VALUES (?, ?)", (uid, text))
+        await db.commit()
+
+
+async def del_message(mid, uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM messages WHERE id = ? AND user_id = ?", (mid, uid))
+        await db.commit()
+
+
+async def already_invited(uid, target_id, tg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM invited WHERE user_id = ? AND target_id = ? AND uid = ?",
+                               (uid, target_id, tg_id))
+        return bool(await cur.fetchone())
+
+
+async def already_pending(uid, target_id, tg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM queue WHERE user_id = ? AND target_id = ? AND uid = ? AND status = 'pending'",
+            (uid, target_id, tg_id))
+        return bool(await cur.fetchone())
+
+
+async def enqueue(uid, acc_id, target, u):
+    if await already_invited(uid, target["id"], u["id"]):
+        return False
+    if await already_pending(uid, target["id"], u["id"]):
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''INSERT INTO queue (user_id, account_id, target_id, target_type,
+            target_access_hash, uid, user_username, first_name, last_name, access_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+            uid, acc_id, target["id"], target.get("type", "channel"), target.get("access_hash", 0),
+            u["id"], u["username"], u["first_name"], u["last_name"], u["access_hash"]))
+        await db.commit()
+    return True
+
+
+async def pop_batch(uid, limit=100000):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute('''SELECT id, account_id, target_id, target_type, target_access_hash,
+            uid, user_username, first_name, last_name, access_hash
+            FROM queue WHERE user_id = ? AND status = 'pending' ORDER BY id LIMIT ?''', (uid, limit))
+        rows = await cur.fetchall()
+        return [{"id": r[0], "account_id": r[1], "target_id": r[2], "target_type": r[3],
+                 "target_access_hash": r[4], "uid": r[5], "user_username": r[6],
+                 "first_name": r[7], "last_name": r[8], "access_hash": r[9]} for r in rows]
+
+
+async def set_status(qid, status, err=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE queue SET status = ?, error = ? WHERE id = ?", (status, err, qid))
+        await db.commit()
+
+
+async def get_queue_item(qid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, status FROM queue WHERE id = ?", (qid,))
+        r = await cur.fetchone()
+        return {"id": r[0], "status": r[1]} if r else None
+
+
+async def mark_invited(uid, target_id, tg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("INSERT OR IGNORE INTO invited (user_id, target_id, uid) VALUES (?, ?, ?)",
+                             (uid, target_id, tg_id))
+            await db.commit()
+        except Exception:
+            pass
+
+
+async def clear_queue(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM queue WHERE user_id = ? AND status != 'invited'", (uid,))
+        await db.commit()
+
+
+async def stats(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT status, COUNT(*) FROM queue WHERE user_id = ? GROUP BY status", (uid,))
+        return {r[0]: r[1] for r in await cur.fetchall()}
+
+
+async def save_jobs(uid, mailing_id=None, parsing_id=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT mailing_id, parsing_id FROM jobs WHERE user_id = ?", (uid,))
+        r = await cur.fetchone()
+        old_m = r[0] if r else None
+        old_p = r[1] if r else None
+        new_m = mailing_id if mailing_id is not None else old_m
+        new_p = parsing_id if parsing_id is not None else old_p
+        await db.execute("INSERT OR REPLACE INTO jobs (user_id, mailing_id, parsing_id) VALUES (?, ?, ?)",
+                         (uid, new_m, new_p))
+        await db.commit()
+
+
+async def get_jobs(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT mailing_id, parsing_id FROM jobs WHERE user_id = ?", (uid,))
+        r = await cur.fetchone()
+        return (r[0], r[1]) if r else (None, None)
+
+
+# ---------- РАССЫЛКА ----------
+async def send_messages_for_user(uid):
+    try:
+        accounts = [a for a in await get_accounts(uid) if a["is_active"]]
+        messages = await get_messages(uid)
+        if not accounts or not messages:
+            return
+        for acc in accounts:
+            if not acc["chats"]:
+                continue
+            client = make_client(acc["session_string"])
+            try:
+                await client.start()
+                for chat in acc["chats"]:
+                    for msg in messages:
+                        try:
+                            await client.send_message(chat["id"], msg["text"])
+                            await inc_sent(acc["id"], uid, 1)
+                            await asyncio.sleep(1)
+                        except FloodWaitError as e:
+                            await asyncio.sleep(e.seconds)
+                        except Exception as e:
+                            logging.error(f"send[{acc['phone']}]: {e}")
+            except Exception as e:
+                logging.error(f"mailing client[{acc['phone']}]: {e}")
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+    except Exception as e:
+        logging.error(f"send_messages_for_user[{uid}]: {e}")
+
+
+async def start_mailing(uid):
+    mid, _ = await get_jobs(uid)
+    if mid:
+        try:
+            scheduler.get_job(mid)
+            return False
+        except JobLookupError:
+            pass
+    settings = await get_settings(uid)
+    job = scheduler.add_job(send_messages_for_user, "interval",
+                            seconds=settings["interval"], args=[uid],
+                            id=f"mail_{uid}", replace_existing=True,
+                            max_instances=1, coalesce=True, misfire_grace_time=120)
+    await save_jobs(uid, mailing_id=job.id)
+    asyncio.create_task(send_messages_for_user(uid))
+    return True
+
+
+async def stop_mailing(uid):
+    mid, _ = await get_jobs(uid)
+    if mid:
+        try:
+            scheduler.remove_job(mid)
+        except JobLookupError:
+            pass
+    await save_jobs(uid, mailing_id="")
+
+
+# ---------- ПАРСИНГ ----------
+async def parse_source(client, src):
+    try:
+        entity = await client.get_entity(src.get("id") or src.get("username"))
+    except Exception as e:
+        logging.warning(f"parse_source entity {src.get('title')}: {e}")
+        return []
+
+    if isinstance(entity, tl_types.Channel):
+        try:
+            result = []
+            offset = 0
+            step = 200
+            while True:
+                part = await client(functions.channels.GetParticipantsRequest(
+                    channel=entity, filter=ChannelParticipantsSearch(''),
+                    offset=offset, limit=step, hash=0))
+                if not part or not part.users:
+                    break
+                for u in part.users:
+                    if u.bot or not getattr(u, "username", None) or not getattr(u, "access_hash", None):
+                        continue
+                    result.append({"id": u.id, "username": u.username,
+                                   "first_name": u.first_name or "",
+                                   "last_name": u.last_name or "",
+                                   "access_hash": u.access_hash})
+                offset += step
+                if len(part.users) < step:
+                    break
+            if result:
+                logging.info(f"parsed {len(result)} via participants from {src.get('title')}")
+                return result
+        except Exception as e:
+            logging.info(f"GetParticipants failed for {src.get('title')}, fallback: {e}")
+
+    return await parse_from_messages(client, entity)
+
+
+async def parse_from_messages(client, entity):
+    result = []
+    seen_ids = set()
+    scanned = 0
+    try:
+        async for msg in client.iter_messages(entity):
+            scanned += 1
+            if scanned > MAX_MESSAGES_SCAN:
+                logging.warning(f"scan limit reached for {entity}")
+                break
+            try:
+                sender = await msg.get_sender()
+            except Exception:
+                continue
+            if sender is None or getattr(sender, "bot", False):
+                continue
+            if not getattr(sender, "username", None):
+                continue
+            if not getattr(sender, "access_hash", None):
+                continue
+            if sender.id in seen_ids:
+                continue
+            seen_ids.add(sender.id)
+            result.append({
+                "id": sender.id,
+                "username": sender.username,
+                "first_name": sender.first_name or "",
+                "last_name": sender.last_name or "",
+                "access_hash": sender.access_hash,
+            })
+    except Exception as e:
+        logging.warning(f"parse_from_messages {entity}: {e}")
+    logging.info(f"parsed {len(result)} users from {scanned} messages in {entity}")
+    return result
+
+
+async def is_in_target(client, target, tg_id):
+    try:
+        entity = await client.get_entity(target["id"])
+        await client(functions.channels.GetParticipantRequest(channel=entity, participant=tg_id))
+        return True
+    except Exception:
+        return False
+
+
+async def invite(client, target, u):
+    try:
+        await client(AddContactRequest(
+            id=InputPeerUser(u["id"], u["access_hash"]),
+            first_name=u["first_name"] or u["username"] or "User",
+            last_name=u["last_name"] or "",
+            phone="",
+            add_phone_privacy_exception=False))
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            await client(AddContactRequest(
+                id=InputPeerUser(u["id"], u["access_hash"]),
+                first_name=u["first_name"] or u["username"] or "User",
+                last_name=u["last_name"] or "",
+                phone="",
+                add_phone_privacy_exception=False))
+        except Exception:
+            pass
+    except UserPrivacyRestrictedError:
+        return False, "privacy_restricted"
+    except Exception:
+        pass
+
+    try:
+        if target["type"] == "channel":
+            await client(InviteToChannelRequest(
+                channel=InputPeerChannel(target["id"], target["access_hash"]),
+                users=[InputPeerUser(u["id"], u["access_hash"])]))
+        else:
+            await client(AddChatUserRequest(
+                chat_id=target["id"],
+                user_id=InputPeerUser(u["id"], u["access_hash"]), fwd_limit=100))
+        return True, "invited"
+    except UserAlreadyParticipantError:
+        return False, "already_participant"
+    except UserNotMutualContactError:
+        return False, "not_mutual_contact"
+    except UserChannelsTooMuchError:
+        return False, "target_channels_too_much"
+    except ChatAdminRequiredError:
+        return False, "no_admin_rights"
+    except PeerFloodError:
+        return False, "peer_flood"
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        return False, f"flood_wait_{e.seconds}s"
+    except Exception as e:
+        return False, f"error: {type(e).__name__}: {e}"
+
+
+async def parse_and_invite_for_user(uid):
+    if uid in RUNNING:
+        return
+    RUNNING.add(uid)
+    try:
+        accounts = [a for a in await get_accounts(uid) if a["is_active"]]
+
+        # ПАРСИНГ
+        for acc in accounts:
+            if not acc["sources"] or not acc["target"]:
+                continue
+            client = make_client(acc["session_string"])
+            try:
+                await client.start()
+                total = 0
+                for src in acc["sources"]:
+                    users = await parse_source(client, src)
+                    for u in users:
+                        if await is_in_target(client, acc["target"], u["id"]):
+                            continue
+                        if await enqueue(uid, acc["id"], acc["target"], u):
+                            total += 1
+                if total:
+                    await inc_parsed(acc["id"], uid, total)
+            except Exception as e:
+                logging.error(f"parse[{acc['phone']}]: {e}")
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+        # ИНВАЙТ (всё сразу)
+        batch = await pop_batch(uid, 100000)
+        if not batch:
+            return
+        by_acc = {}
+        for it in batch:
+            by_acc.setdefault(it["account_id"], []).append(it)
+
+        for acc_id, items in by_acc.items():
+            acc = next((a for a in accounts if a["id"] == acc_id), None)
+            if not acc:
+                for it in items:
+                    await set_status(it["id"], "skipped", "account_inactive")
+                continue
+
+            client = make_client(acc["session_string"])
+            try:
+                await client.start()
+                for it in items:
+                    target = {"id": it["target_id"], "type": it["target_type"],
+                              "access_hash": it["target_access_hash"]}
+                    u = {"id": it["uid"], "username": it["user_username"],
+                         "first_name": it["first_name"], "last_name": it["last_name"],
+                         "access_hash": it["access_hash"]}
+                    ok, reason = await invite(client, target, u)
+                    if ok:
+                        await set_status(it["id"], "invited")
+                        await mark_invited(uid, it["target_id"], it["uid"])
+                        await inc_invited(acc_id, uid, 1)
+                    else:
+                        if reason in ("already_participant", "not_mutual_contact",
+                                      "target_channels_too_much", "privacy_restricted",
+                                      "no_admin_rights", "peer_flood"):
+                            await set_status(it["id"], "skipped", reason)
+                            await mark_invited(uid, it["target_id"], it["uid"])
+                        elif reason.startswith("flood_wait_") or reason.startswith("flood_contact_"):
+                            await set_status(it["id"], "pending")
+                            try:
+                                secs = int(reason.split("_")[-1].rstrip("s"))
+                            except Exception:
+                                secs = 60
+                            await asyncio.sleep(secs + 1)
+                            ok2, reason2 = await invite(client, target, u)
+                            if ok2:
+                                await set_status(it["id"], "invited")
+                                await mark_invited(uid, it["target_id"], it["uid"])
+                                await inc_invited(acc_id, uid, 1)
+                            else:
+                                await set_status(it["id"], "failed", reason2)
+                        else:
+                            await set_status(it["id"], "failed", reason)
+                    await asyncio.sleep(0.1)
+            except Exception as e:
+                logging.error(f"invite[{acc['phone']}]: {e}")
+                for it in items:
+                    cur = await get_queue_item(it["id"])
+                    if cur and cur["status"] == "pending":
+                        await set_status(it["id"], "failed", str(e))
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+    except Exception as e:
+        logging.error(f"parse_and_invite[{uid}]: {e}")
+    finally:
+        RUNNING.discard(uid)
+
+
+async def start_parsing(uid):
+    _, pid = await get_jobs(uid)
+    if pid:
+        try:
+            scheduler.get_job(pid)
+            return False
+        except JobLookupError:
+            pass
+    job = scheduler.add_job(parse_and_invite_for_user, "interval",
+                            seconds=PROCESS_INTERVAL, args=[uid],
+                            id=f"parse_{uid}", replace_existing=True,
+                            max_instances=1, coalesce=True, misfire_grace_time=300)
+    await save_jobs(uid, parsing_id=job.id)
+    asyncio.create_task(parse_and_invite_for_user(uid))
+    return True
+
+
+async def stop_parsing(uid):
+    _, pid = await get_jobs(uid)
+    if pid:
+        try:
+            scheduler.remove_job(pid)
+        except JobLookupError:
+            pass
+    await save_jobs(uid, parsing_id="")
+
+
+async def restore_jobs():
+    logging.info("restore_jobs start")
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT user_id, mailing_id, parsing_id FROM jobs")
+            for r in await cur.fetchall():
+                uid, mid, pid = r
+                if mid:
+                    try:
+                        scheduler.get_job(mid)
+                    except JobLookupError:
+                        await start_mailing(uid)
+                if pid:
+                    try:
+                        scheduler.get_job(pid)
+                    except JobLookupError:
+                        await start_parsing(uid)
+        logging.info("restore_jobs done")
+    except Exception as e:
+        logging.error(f"restore_jobs: {e}")
+
+
+async def is_mailing_running(uid):
+    mid, _ = await get_jobs(uid)
+    if not mid:
+        return False
+    try:
+        scheduler.get_job(mid)
+        return True
+    except JobLookupError:
+        return False
+
+
+async def is_parsing_running(uid):
+    _, pid = await get_jobs(uid)
+    if not pid:
+        return False
+    try:
+        scheduler.get_job(pid)
+        return True
+    except JobLookupError:
+        return False
+
+
+async def get_dialogs(acc, limit=200):
+    client = make_client(acc["session_string"])
+    out = []
+    try:
+        await client.start()
+        dialogs = await client.get_dialogs(limit=limit)
+        for d in dialogs:
+            if not d.is_group and not d.is_channel:
+                continue
+            try:
+                peer_id = utils.get_peer_id(d.entity)
+                access_hash = getattr(d.entity, "access_hash", 0) or 0
+                is_broadcast = bool(getattr(d.entity, "broadcast", False))
+                is_megagroup = bool(getattr(d.entity, "megagroup", False))
+                out.append({"id": peer_id, "access_hash": access_hash,
+                            "title": d.title or str(peer_id),
+                            "username": getattr(d.entity, "username", None),
+                            "type": "channel" if (is_broadcast or is_megagroup) else "chat"})
+            except Exception:
+                continue
+    except Exception as e:
+        logging.error(f"get_dialogs: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    return out
+
+
+# ---------- КЛАВИАТУРЫ ----------
+def main_menu():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📋 Аккаунты"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="✉️ Рассылка"), KeyboardButton(text="🔍 Парсинг")],
+    ], resize_keyboard=True)
+
+
+def accounts_keyboard(accounts):
+    kb = []
+    for acc in accounts:
+        status = "✅" if acc['is_active'] else "❌"
+        username = acc['username'] if acc['username'] else "без ника"
+        display = f"{status} @{username} • {acc['phone']}"
+        kb.append([KeyboardButton(text=display)])
+    kb.append([KeyboardButton(text="➕ Добавить аккаунт")])
+    kb.append([KeyboardButton(text="🔙 Назад")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def account_detail_keyboard(account_id, is_active):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Выключить" if is_active else "🔄 Включить",
+                              callback_data=f"acc_toggle_{account_id}")],
+        [InlineKeyboardButton(text="✉️ Чаты рассылки", callback_data=f"acc_chats_{account_id}"),
+         InlineKeyboardButton(text="📥 Источники", callback_data=f"acc_src_{account_id}")],
+        [InlineKeyboardButton(text="📤 Цель", callback_data=f"acc_tgt_{account_id}"),
+         InlineKeyboardButton(text="✏️ Профиль", callback_data=f"acc_prof_{account_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"acc_del_{account_id}"),
+         InlineKeyboardButton(text="🔙 К списку", callback_data="back_to_accounts")],
+    ])
+
+
+def chats_menu(acc_id, chats):
+    kb = []
+    for i, c in enumerate(chats):
+        kb.append([InlineKeyboardButton(text=f"❌ {c.get('title', c['id'])}",
+                                        callback_data=f"chat_del_{acc_id}_{i}")])
+    kb.append([InlineKeyboardButton(text="📋 Выбрать из чатов", callback_data=f"chat_pick_{acc_id}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{acc_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def sources_menu(acc_id, sources):
+    kb = []
+    for i, s in enumerate(sources):
+        kb.append([InlineKeyboardButton(text=f"❌ {s.get('title', s['id'])}",
+                                        callback_data=f"src_del_{acc_id}_{i}")])
+    kb.append([InlineKeyboardButton(text="📋 Выбрать из чатов", callback_data=f"src_pick_{acc_id}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{acc_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def target_menu(acc_id, target):
+    kb = []
+    if target:
+        kb.append([InlineKeyboardButton(text=f"❌ {target.get('title', target['id'])}",
+                                        callback_data=f"tgt_del_{acc_id}")])
+    kb.append([InlineKeyboardButton(text="📋 Выбрать из чатов", callback_data=f"tgt_pick_{acc_id}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{acc_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def picker_menu(acc_id, dialogs, kind):
+    kb = []
+    for i, d in enumerate(dialogs):
+        kb.append([InlineKeyboardButton(text=f"{d['title'][:42]}",
+                                        callback_data=f"{kind}_add_{acc_id}_{i}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{acc_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def profile_menu(acc_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Имя", callback_data=f"prof_first_{acc_id}"),
+         InlineKeyboardButton(text="📛 Фамилия", callback_data=f"prof_last_{acc_id}")],
+        [InlineKeyboardButton(text="🔗 Юзернейм", callback_data=f"prof_user_{acc_id}"),
+         InlineKeyboardButton(text="🖼 Аватар", callback_data=f"prof_av_{acc_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{acc_id}")],
+    ])
+
+
+def mailing_menu(is_running):
+    btn = "⏹ Остановить рассылку" if is_running else "▶️ Запустить рассылку"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn, callback_data="mail_toggle")],
+        [InlineKeyboardButton(text="📝 Тексты", callback_data="mail_msgs")],
+        [InlineKeyboardButton(text="⏱ Интервал", callback_data="set_interval")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")],
+    ])
+
+
+def parsing_menu(is_running):
+    btn = "⏹ Остановить парсинг" if is_running else "▶️ Запустить парсинг"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn, callback_data="parse_toggle")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="parse_stats")],
+        [InlineKeyboardButton(text="⏸ Задержка инвайтов", callback_data="set_delay")],
+        [InlineKeyboardButton(text="🧹 Очистить очередь", callback_data="parse_clear")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")],
+    ])
+
+
+def messages_menu(msgs):
+    kb = []
+    for m in msgs:
+        kb.append([InlineKeyboardButton(text=f"❌ {m['text'][:30]}...",
+                                        callback_data=f"msg_del_{m['id']}")])
+    kb.append([InlineKeyboardButton(text="➕ Добавить текст", callback_data="msg_add")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="mail_open")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def interval_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 мин", callback_data="int_60"),
+         InlineKeyboardButton(text="5 мин", callback_data="int_300"),
+         InlineKeyboardButton(text="10 мин", callback_data="int_600")],
+        [InlineKeyboardButton(text="30 мин", callback_data="int_1800"),
+         InlineKeyboardButton(text="1 час", callback_data="int_3600"),
+         InlineKeyboardButton(text="3 часа", callback_data="int_10800")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="mail_open")],
+    ])
+
+
+# ---------- FSM ----------
+class AddAccountStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
+
+
+class EditMessagesStates(StatesGroup):
+    waiting_new_message = State()
+
+
+class ProfileEditStates(StatesGroup):
+    waiting_first_name = State()
+    waiting_last_name = State()
+    waiting_username = State()
+    waiting_avatar = State()
+
+
+class SettingsStates(StatesGroup):
+    waiting_delay = State()
+
+
+# ---------- ХЕНДЛЕРЫ АККАУНТОВ ----------
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await ensure_user(message.from_user.id, message.from_user.username)
+    await message.answer("🤖 Бот рассылки + парсинга.\nКнопки внизу:", reply_markup=main_menu())
+
+
+@dp.message(F.text == "📋 Аккаунты")
+async def show_accounts(message: types.Message):
+    user_id = message.from_user.id
+    await ensure_user(user_id, message.from_user.username)
+    accounts = await get_accounts(user_id)
+    if not accounts:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="➕ Добавить аккаунт")],
+                      [KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
+        await message.answer("Нет аккаунтов.", reply_markup=kb)
+    else:
+        await message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+
+
+@dp.message(F.text == "➕ Добавить аккаунт")
+async def add_account_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите номер телефона в формате +79123456789:")
+    await state.set_state(AddAccountStates.waiting_phone)
+
+
+@dp.message(AddAccountStates.waiting_phone)
+async def add_account_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    if not phone.startswith("+"):
+        await message.answer("Номер должен начинаться с +.")
+        return
+    await state.update_data(phone=phone)
+    client = make_client(None)
+    await state.update_data(client=client)
+    try:
+        await client.connect()
+        await client.send_code_request(phone)
+        await message.answer("Код отправлен. Введите его:")
+        await state.set_state(AddAccountStates.waiting_code)
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+        await state.clear()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+@dp.message(AddAccountStates.waiting_code)
+async def add_account_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    data = await state.get_data()
+    client = data.get("client")
+    phone = data.get("phone")
+    if not client:
+        await message.answer("Сессия потеряна.")
+        await state.clear()
+        return
+    try:
+        await client.sign_in(phone, code)
+        session_string = client.session.save()
+        me = await client.get_me()
+        username = me.username if me.username else None
+        await add_account(message.from_user.id, phone, username, session_string)
+        await message.answer("Аккаунт добавлен!")
+        accounts = await get_accounts(message.from_user.id)
+        await message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+    except SessionPasswordNeededError:
+        await message.answer("Введите пароль 2FA:")
+        await state.set_state(AddAccountStates.waiting_password)
+        return
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    await state.clear()
+
+
+@dp.message(AddAccountStates.waiting_password)
+async def add_account_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    client = data.get("client")
+    phone = data.get("phone")
+    if not client:
+        await message.answer("Сессия потеряна.")
+        await state.clear()
+        return
+    try:
+        await client.sign_in(password=password)
+        session_string = client.session.save()
+        me = await client.get_me()
+        username = me.username if me.username else None
+        await add_account(message.from_user.id, phone, username, session_string)
+        await message.answer("Аккаунт добавлен!")
+        accounts = await get_accounts(message.from_user.id)
+        await message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    await state.clear()
+
+
+@dp.message(F.text.startswith("✅") | F.text.startswith("❌"))
+async def account_detail(message: types.Message):
+    parts = message.text.split(" • ")
+    if len(parts) < 2:
+        await message.answer("Не удалось распознать аккаунт.")
+        return
+    phone = parts[1].strip()
+    accounts = await get_accounts(message.from_user.id)
+    acc = next((a for a in accounts if a["phone"] == phone), None)
+    if not acc:
+        await message.answer("Аккаунт не найден.")
+        return
+    text = (
+        f"📱 Аккаунт: @{acc['username'] if acc['username'] else 'без ника'}\n"
+        f"📞 Номер: {acc['phone']}\n"
+        f"✉️ Чатов рассылки: {len(acc['chats'])}\n"
+        f"📥 Источников: {len(acc['sources'])}\n"
+        f"📤 Цель: {acc['target'].get('title') if acc['target'] else '—'}\n"
+        f"📊 Спарсено: {acc['parsed_count']} | 📨 Инвайтов: {acc['invited_count']} | ✉️ Отправлено: {acc['sent_count']}\n"
+        f"Статус: {'✅ Включён' if acc['is_active'] else '❌ Выключен'}"
+    )
+    await message.answer(text, reply_markup=account_detail_keyboard(acc["id"], acc["is_active"]))
+
+
+@dp.callback_query(F.data == "back_to_accounts")
+async def back_to_accounts(callback: types.CallbackQuery):
+    accounts = await get_accounts(callback.from_user.id)
+    await callback.message.delete()
+    await callback.message.answer("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("acc_toggle_"))
+async def toggle_account(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    acc = await get_account(account_id, user_id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    await toggle_acc(account_id, user_id, not acc["is_active"])
+    await callback.answer("Обновлено")
+    acc = await get_account(account_id, user_id)
+    text = (
+        f"📱 Аккаунт: @{acc['username'] if acc['username'] else 'без ника'}\n"
+        f"📞 Номер: {acc['phone']}\n"
+        f"✉️ Чатов рассылки: {len(acc['chats'])}\n"
+        f"📥 Источников: {len(acc['sources'])}\n"
+        f"📤 Цель: {acc['target'].get('title') if acc['target'] else '—'}\n"
+        f"📊 Спарсено: {acc['parsed_count']} | 📨 Инвайтов: {acc['invited_count']} | ✉️ Отправлено: {acc['sent_count']}\n"
+        f"Статус: {'✅ Включён' if acc['is_active'] else '❌ Выключен'}"
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=account_detail_keyboard(acc["id"], acc["is_active"]))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("acc_del_"))
+async def delete_account(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    await del_account(account_id, callback.from_user.id)
+    await callback.answer("Удалён")
+    accounts = await get_accounts(callback.from_user.id)
+    try:
+        await callback.message.edit_text("Ваши аккаунты:", reply_markup=accounts_keyboard(accounts))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("acc_back_"))
+async def account_back(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    acc = await get_account(account_id, user_id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    text = (
+        f"📱 Аккаунт: @{acc['username'] if acc['username'] else 'без ника'}\n"
+        f"📞 Номер: {acc['phone']}\n"
+        f"✉️ Чатов рассылки: {len(acc['chats'])}\n"
+        f"📥 Источников: {len(acc['sources'])}\n"
+        f"📤 Цель: {acc['target'].get('title') if acc['target'] else '—'}\n"
+        f"📊 Спарсено: {acc['parsed_count']} | 📨 Инвайтов: {acc['invited_count']} | ✉️ Отправлено: {acc['sent_count']}\n"
+        f"Статус: {'✅ Включён' if acc['is_active'] else '❌ Выключен'}"
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=account_detail_keyboard(acc["id"], acc["is_active"]))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+# ---------- ЧАТЫ РАССЫЛКИ ----------
+@dp.callback_query(F.data.startswith("acc_chats_"))
+async def show_chats(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    text = "✉️ Чаты рассылки:\n" + (
+        "\n".join(f"{i+1}. {c.get('title')}" for i, c in enumerate(acc["chats"]))
+        if acc["chats"] else "Пусто."
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=chats_menu(account_id, acc["chats"]))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("chat_pick_"))
+async def pick_chat(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    await callback.answer("Загружаю...")
+    dialogs = await get_dialogs(acc)
+    if not dialogs:
+        await callback.message.answer("Нет чатов.")
+        return
+    await state.update_data(dialogs=dialogs)
+    try:
+        await callback.message.edit_text("Выбери чат:", reply_markup=picker_menu(account_id, dialogs, "chat"))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("chat_add_"))
+async def add_chat(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    account_id = int(parts[2])
+    idx = int(parts[3])
+    data = await state.get_data()
+    dialogs = data.get("dialogs", [])
+    if not (0 <= idx < len(dialogs)):
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    acc = await get_account(account_id, callback.from_user.id)
+    new = dialogs[idx]
+    chats = acc["chats"]
+    if not any(c["id"] == new["id"] for c in chats):
+        chats.append(new)
+        await save_chats(account_id, callback.from_user.id, chats)
+    await callback.answer(f"+ {new['title']}")
+    text = "✉️ Чаты рассылки:\n" + "\n".join(f"{i+1}. {c.get('title')}" for i, c in enumerate(chats))
+    try:
+        await callback.message.edit_text(text, reply_markup=chats_menu(account_id, chats))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("chat_del_"))
+async def delete_chat(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    account_id = int(parts[2])
+    idx = int(parts[3])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    chats = acc["chats"]
+    if 0 <= idx < len(chats):
+        chats.pop(idx)
+        await save_chats(account_id, callback.from_user.id, chats)
+    await callback.answer("Удалено")
+    text = "✉️ Чаты рассылки:\n" + (
+        "\n".join(f"{i+1}. {c.get('title')}" for i, c in enumerate(chats))
+        if chats else "Пусто."
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=chats_menu(account_id, chats))
+    except TelegramBadRequest:
+        pass
+
+
+# ---------- ИСТОЧНИКИ ----------
+@dp.callback_query(F.data.startswith("acc_src_"))
+async def show_sources(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    text = "📥 Источники:\n" + (
+        "\n".join(f"{i+1}. {s.get('title')}" for i, s in enumerate(acc["sources"]))
+        if acc["sources"] else "Пусто."
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=sources_menu(account_id, acc["sources"]))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("src_pick_"))
+async def pick_source(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    await callback.answer("Загружаю...")
+    dialogs = await get_dialogs(acc)
+    if not dialogs:
+        await callback.message.answer("Нет чатов.")
+        return
+    await state.update_data(dialogs=dialogs)
+    try:
+        await callback.message.edit_text("Выбери источник:", reply_markup=picker_menu(account_id, dialogs, "src"))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("src_add_"))
+async def add_source(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    account_id = int(parts[2])
+    idx = int(parts[3])
+    data = await state.get_data()
+    dialogs = data.get("dialogs", [])
+    if not (0 <= idx < len(dialogs)):
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    acc = await get_account(account_id, callback.from_user.id)
+    new = dialogs[idx]
+    srcs = acc["sources"]
+    if not any(s["id"] == new["id"] for s in srcs):
+        srcs.append(new)
+        await save_sources(account_id, callback.from_user.id, srcs)
+    await callback.answer(f"+ {new['title']}")
+    text = "📥 Источники:\n" + "\n".join(f"{i+1}. {s.get('title')}" for i, s in enumerate(srcs))
+    try:
+        await callback.message.edit_text(text, reply_markup=sources_menu(account_id, srcs))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("src_del_"))
+async def delete_source(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    account_id = int(parts[2])
+    idx = int(parts[3])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    srcs = acc["sources"]
+    if 0 <= idx < len(srcs):
+        srcs.pop(idx)
+        await save_sources(account_id, callback.from_user.id, srcs)
+    await callback.answer("Удалено")
+    text = "📥 Источники:\n" + (
+        "\n".join(f"{i+1}. {s.get('title')}" for i, s in enumerate(srcs))
+        if srcs else "Пусто."
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=sources_menu(account_id, srcs))
+    except TelegramBadRequest:
+        pass
+
+
+# ---------- ЦЕЛЬ ----------
+@dp.callback_query(F.data.startswith("acc_tgt_"))
+async def show_target(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    text = "📤 Цель:\n" + (acc["target"].get("title") if acc["target"] else "Не выбрана.")
+    try:
+        await callback.message.edit_text(text, reply_markup=target_menu(account_id, acc["target"]))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("tgt_pick_"))
+async def pick_target(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    await callback.answer("Загружаю...")
+    dialogs = await get_dialogs(acc)
+    if not dialogs:
+        await callback.message.answer("Нет чатов.")
+        return
+    await state.update_data(dialogs=dialogs)
+    try:
+        await callback.message.edit_text("Выбери цель:", reply_markup=picker_menu(account_id, dialogs, "tgt"))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("tgt_add_"))
+async def add_target(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    account_id = int(parts[2])
+    idx = int(parts[3])
+    data = await state.get_data()
+    dialogs = data.get("dialogs", [])
+    if not (0 <= idx < len(dialogs)):
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    new = dialogs[idx]
+    await save_target(account_id, callback.from_user.id, new)
+    await callback.answer(f"Цель: {new['title']}")
+    try:
+        await callback.message.edit_text("📤 Цель:\n" + new["title"], reply_markup=target_menu(account_id, new))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("tgt_del_"))
+async def delete_target(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    await save_target(account_id, callback.from_user.id, None)
+    await callback.answer("Удалено")
+    try:
+        await callback.message.edit_text("📤 Цель не выбрана.", reply_markup=target_menu(account_id, None))
+    except TelegramBadRequest:
+        pass
+
+
+# ---------- ПРОФИЛЬ ----------
+@dp.callback_query(F.data.startswith("acc_prof_"))
+async def show_profile(callback: types.CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    acc = await get_account(account_id, callback.from_user.id)
+    if not acc:
+        await callback.answer("Не найден.", show_alert=True)
+        return
+    info = "✏️ Профиль\n\n"
+    client = make_client(acc["session_string"])
+    try:
+        await client.start()
+        me = await client.get_me()
+        info += (
+            f"👤 Имя: {me.first_name or '—'}\n"
+            f"📛 Фамилия: {me.last_name or '—'}\n"
+            f"🔗 Юзернейм: @{me.username if me.username else '—'}\n"
+            f"📞 Телефон: {me.phone or acc['phone']}"
+        )
+    except Exception as e:
+        info += f"Ошибка: {e}"
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    try:
+        await callback.message.edit_text(info, reply_markup=profile_menu(account_id))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("prof_first_"))
+async def prof_first_start(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    await state.update_data(account_id=account_id)
+    await callback.message.answer("Введите новое имя:")
+    await state.set_state(ProfileEditStates.waiting_first_name)
+    await callback.answer()
+
+
+@dp.message(ProfileEditStates.waiting_first_name)
+async def prof_set_first(message: types.Message, state: FSMContext):
+    new_name = message.text.strip()
+    if len(new_name) > 64 or not new_name:
+        await message.answer("Имя 1-64 символа.")
+        return
+    data = await state.get_data()
+    account_id = data["account_id"]
+    acc = await get_account(account_id, message.from_user.id)
+    client = make_client(acc["session_string"])
+    try:
+        await client.start()
+        me = await client.get_me()
+        await client(UpdateProfileRequest(first_name=new_name, last_name=me.last_name or ""))
+        await message.answer(f"✅ Имя: «{new_name}».")
+    except FloodWaitError as e:
+        await message.answer(f"Подожди {e.seconds} сек.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("prof_last_"))
+async def prof_last_start(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    await state.update_data(account_id=account_id)
+    await callback.message.answer("Введите новую фамилию:")
+    await state.set_state(ProfileEditStates.waiting_last_name)
+    await callback.answer()
+
+
+@dp.message(ProfileEditStates.waiting_last_name)
+async def prof_set_last(message: types.Message, state: FSMContext):
+    new_last = message.text.strip()
+    if len(new_last) > 64:
+        await message.answer("До 64 символов.")
+        return
+    data = await state.get_data()
+    account_id = data["account_id"]
+    acc = await get_account(account_id, message.from_user.id)
+    client = make_client(acc["session_string"])
+    try:
+        await client.start()
+        me = await client.get_me()
+        await client(UpdateProfileRequest(first_name=me.first_name or "", last_name=new_last))
+        await message.answer(f"✅ Фамилия: «{new_last or '(пусто)'}».")
+    except FloodWaitError as e:
+        await message.answer(f"Подожди {e.seconds} сек.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("prof_user_"))
+async def prof_user_start(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    await state.update_data(account_id=account_id)
+    await callback.message.answer("Введите новый юзернейм (5-32, a-z0-9_). «-» = удалить.")
+    await state.set_state(ProfileEditStates.waiting_username)
+    await callback.answer()
+
+
+@dp.message(ProfileEditStates.waiting_username)
+async def prof_set_username(message: types.Message, state: FSMContext):
+    new_user = message.text.strip().lstrip("@")
+    if new_user == "-":
+        new_user = ""
+    elif len(new_user) < 5 or len(new_user) > 32 or not all(c.isalnum() or c == "_" for c in new_user):
+        await message.answer("Неверный формат.")
+        return
+    data = await state.get_data()
+    account_id = data["account_id"]
+    acc = await get_account(account_id, message.from_user.id)
+    client = make_client(acc["session_string"])
+    try:
+        await client.start()
+        try:
+            await client(UpdateUsernameRequest(username=new_user))
+        except UsernameOccupiedError:
+            await message.answer("❌ Занят.")
+            return
+        except UsernameInvalidError:
+            await message.answer("❌ Неверный формат.")
+            return
+        await save_username(account_id, message.from_user.id, new_user or None)
+        await message.answer(f"✅ @{new_user if new_user else '(удалён)'}")
+    except FloodWaitError as e:
+        await message.answer(f"Подожди {e.seconds} сек.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("prof_av_"))
+async def prof_avatar_start(callback: types.CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    await state.update_data(account_id=account_id)
+    await callback.message.answer("Отправьте фото или «-» для удаления.")
+    await state.set_state(ProfileEditStates.waiting_avatar)
+    await callback.answer()
+
+
+@dp.message(ProfileEditStates.waiting_avatar, F.photo | F.text)
+async def prof_set_avatar(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    account_id = data["account_id"]
+    acc = await get_account(account_id, message.from_user.id)
+    if not acc:
+        await message.answer("Аккаунт не найден.")
+        await state.clear()
+        return
+    client = make_client(acc["session_string"])
+    try:
+        await client.start()
+        if message.text and message.text.strip() == "-":
+            try:
+                photos = await client(GetUserPhotosRequest(user_id="me", offset=0, max_id=0, limit=100))
+                if photos.photos:
+                    await client(DeletePhotosRequest(id=photos.photos))
+                await message.answer("✅ Аватар удалён.")
+            except Exception as e:
+                await message.answer(f"❌ {e}")
+        elif message.photo:
+            file = await message.bot.get_file(message.photo[-1].file_id)
+            tmp_path = f"/tmp/avatar_{account_id}_{message.message_id}.jpg"
+            await message.bot.download_file(file.file_path, tmp_path)
+            try:
+                uploaded = await client.upload_file(tmp_path)
+                await client(UploadProfilePhotoRequest(file=uploaded))
+                await message.answer("✅ Аватар установлен.")
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        else:
+            await message.answer("Отправьте фото или «-».")
+            await state.clear()
+            return
+    except FloodWaitError as e:
+        await message.answer(f"Подожди {e.seconds} сек.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    await state.clear()
+
+
+# ---------- РАССЫЛКА ----------
+@dp.message(F.text == "✉️ Рассылка")
+async def open_mailing(message: types.Message):
+    await ensure_user(message.from_user.id, message.from_user.username)
+    running = await is_mailing_running(message.from_user.id)
+    await message.answer("✉️ Рассылка:", reply_markup=mailing_menu(running))
+
+
+@dp.callback_query(F.data == "mail_toggle")
+async def mail_toggle(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    running = await is_mailing_running(uid)
+    if running:
+        await stop_mailing(uid)
+        await callback.answer("Остановлено")
+    else:
+        accs = [a for a in await get_accounts(uid) if a["is_active"] and a["chats"]]
+        if not accs:
+            await callback.answer("Нет активных аккаунтов с чатами.", show_alert=True)
+            return
+        msgs = await get_messages(uid)
+        if not msgs:
+            await callback.answer("Нет текстов.", show_alert=True)
+            return
+        await start_mailing(uid)
+        await callback.answer("Запущено")
+    running = await is_mailing_running(uid)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=mailing_menu(running))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data == "mail_open")
+async def mail_open(callback: types.CallbackQuery):
+    running = await is_mailing_running(callback.from_user.id)
+    try:
+        await callback.message.edit_text("✉️ Рассылка:", reply_markup=mailing_menu(running))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mail_msgs")
+async def mail_msgs(callback: types.CallbackQuery):
+    msgs = await get_messages(callback.from_user.id)
+    text = "📝 Тексты:\n" + (
+        "\n".join(f"{i+1}. {m['text'][:40]}" for i, m in enumerate(msgs))
+        if msgs else "Пусто."
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=messages_menu(msgs))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "msg_add")
+async def msg_add(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите текст:")
+    await state.set_state(EditMessagesStates.waiting_new_message)
+    await callback.answer()
+
+
+@dp.message(EditMessagesStates.waiting_new_message)
+async def msg_save(message: types.Message, state: FSMContext):
+    await add_message(message.from_user.id, message.text)
+    await message.answer("✅ Добавлено")
+    await state.clear()
+    msgs = await get_messages(message.from_user.id)
+    await message.answer("📝 Тексты:", reply_markup=messages_menu(msgs))
+
+
+@dp.callback_query(F.data.startswith("msg_del_"))
+async def msg_delete(callback: types.CallbackQuery):
+    mid = int(callback.data.split("_")[2])
+    await del_message(mid, callback.from_user.id)
+    await callback.answer("Удалено")
+    msgs = await get_messages(callback.from_user.id)
+    try:
+        await callback.message.edit_text("📝 Тексты:", reply_markup=messages_menu(msgs))
+    except TelegramBadRequest:
+        pass
+
+
+# ---------- ПАРСИНГ ----------
+@dp.message(F.text == "🔍 Парсинг")
+async def open_parsing(message: types.Message):
+    await ensure_user(message.from_user.id, message.from_user.username)
+    running = await is_parsing_running(message.from_user.id)
+    await message.answer("🔍 Парсинг + инвайт:", reply_markup=parsing_menu(running))
+
+
+@dp.callback_query(F.data == "parse_toggle")
+async def parse_toggle(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    running = await is_parsing_running(uid)
+    if running:
+        await stop_parsing(uid)
+        await callback.answer("Остановлено")
+    else:
+        accs = [a for a in await get_accounts(uid) if a["is_active"] and a["sources"] and a["target"]]
+        if not accs:
+            await callback.answer("Нет активных аккаунтов с источниками и целью.", show_alert=True)
+            return
+        await start_parsing(uid)
+        await callback.answer("Запущено")
+    running = await is_parsing_running(uid)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=parsing_menu(running))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data == "parse_stats")
+async def parse_stats(callback: types.CallbackQuery):
+    s = await stats(callback.from_user.id)
+    text = (
+        f"📊 Очередь:\n"
+        f"⏳ pending: {s.get('pending', 0)}\n"
+        f"✅ invited: {s.get('invited', 0)}\n"
+        f"⏭ skipped: {s.get('skipped', 0)}\n"
+        f"❌ failed: {s.get('failed', 0)}"
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=parsing_menu(await is_parsing_running(callback.from_user.id)))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "parse_clear")
+async def parse_clear(callback: types.CallbackQuery):
+    await clear_queue(callback.from_user.id)
+    await callback.answer("Очередь очищена")
+    try:
+        await callback.message.edit_text(
+            "🧹 Очередь очищена.",
+            reply_markup=parsing_menu(await is_parsing_running(callback.from_user.id))
+        )
+    except TelegramBadRequest:
+        pass
+
+
+# ---------- НАСТРОЙКИ ----------
+@dp.message(F.text == "⚙️ Настройки")
+async def open_settings(message: types.Message):
+    await ensure_user(message.from_user.id, message.from_user.username)
+    await message.answer("⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✉️ Рассылка", callback_data="mail_open")],
+        [InlineKeyboardButton(text="🔍 Парсинг", callback_data="parse_open")],
+    ]))
+
+
+@dp.callback_query(F.data == "parse_open")
+async def parse_open(callback: types.CallbackQuery):
+    running = await is_parsing_running(callback.from_user.id)
+    try:
+        await callback.message.edit_text("🔍 Парсинг + инвайт:", reply_markup=parsing_menu(running))
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "set_interval")
+async def set_interval_open(callback: types.CallbackQuery):
+    await callback.message.edit_text("Выбери интервал рассылки:", reply_markup=interval_menu())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("int_"))
+async def set_interval_value(callback: types.CallbackQuery):
+    v = int(callback.data.split("_")[1])
+    await set_setting(callback.from_user.id, "interval", v)
+    await callback.answer(f"{v} сек")
+    running = await is_mailing_running(callback.from_user.id)
+    try:
+        await callback.message.edit_text("✉️ Рассылка:", reply_markup=mailing_menu(running))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data == "set_delay")
+async def set_delay_open(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи задержку инвайтов (сек), например 0.5:")
+    await state.set_state(SettingsStates.waiting_delay)
+    await callback.answer()
+
+
+@dp.message(SettingsStates.waiting_delay)
+async def set_delay_save(message: types.Message, state: FSMContext):
+    try:
+        v = float(message.text.strip().replace(",", "."))
+        if v < 0 or v > 60:
+            raise ValueError
+        await set_setting(message.from_user.id, "delay", v)
+        await message.answer(f"✅ {v} сек")
+    except ValueError:
+        await message.answer("Число 0–60.")
+    await state.clear()
+
+
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.message.answer("Главное меню:", reply_markup=main_menu())
+    await callback.answer()
+
+
+@dp.message(F.text == "🔙 Назад")
+async def back_to_menu(message: types.Message):
+    await message.answer("Главное меню:", reply_markup=main_menu())
+
+
+@dp.message()
+async def fallback(message: types.Message):
+    pass
+
+
+async def main():
+    logging.info("=== BOT STARTING ===")
+    await init_db()
+    if not scheduler.running:
+        scheduler.start()
+    await restore_jobs()
+    bot = Bot(token=BOT_TOKEN)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logging.warning(f"delete_webhook: {e}")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
